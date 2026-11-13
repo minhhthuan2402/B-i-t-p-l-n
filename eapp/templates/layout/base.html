@@ -20,5 +20,7 @@
 {% block footer %}
     {% include 'layout/footer.html' %}
 {% endblock %}
+
+{{ 'active' if request.path == '...' else '' }}
 </body>
 </html>
