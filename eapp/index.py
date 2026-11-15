@@ -1,8 +1,7 @@
 
 from flask import Flask, render_template, request
+from eapp import app
 from unicodedata import category
-
-app = Flask(__name__)
 
 
 @app.route('/')
