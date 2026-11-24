@@ -2,7 +2,7 @@
 from flask import redirect, render_template, request, jsonify, session
 from flask_login import current_user, login_user, logout_user
 from functools import wraps
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from eapp import app, db, dao, login, vnpay
 import secrets
 import hmac
@@ -12,20 +12,28 @@ import hmac
 def get_user(user_id):
     return dao.get_user_by_id(int(user_id))
 
+# thiết lập phân quyền
+def roles_required(*roles):
+    def decorator(function):
+        @wraps(function)
+        def wrapper(*args, **kwargs):
+            if not current_user.is_authenticated:
+                return jsonify(error='Can dang nhap.'), 401
+            if current_user.status != 'ACTIVE' or current_user.role not in roles:
+                return jsonify(error='Khong co quyen su dung chuc nang nay.'), 403
+            if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+                expected = session.get('csrf_token', '')
+                if not expected or not hmac.compare_digest(expected.encode('utf-8'), request.headers.get('X-CSRF-Token', '').encode('utf-8')):
+                    return jsonify(error='CSRF token khong hop le.'), 403
+            return function(*args, **kwargs)
+        return wrapper
+    return decorator
 
-def cashier_required(function):
-    @wraps(function)
-    def wrapper(*args, **kwargs):
-        if not current_user.is_authenticated:
-            return jsonify(error='Can dang nhap.'), 401
-        if current_user.status != 'ACTIVE' or current_user.role != 'CASHIER':
-            return jsonify(error='Chi thu ngan duoc su dung API thanh toan.'), 403
-        if request.method == 'POST':
-            expected = session.get('csrf_token', '')
-            if not expected or not hmac.compare_digest(expected.encode('utf-8'), request.headers.get('X-CSRF-Token', '').encode('utf-8')):
-                return jsonify(error='CSRF token khong hop le.'), 403
-        return function(*args, **kwargs)
-    return wrapper
+
+cashier_required = roles_required('CASHIER')
+admin_required = roles_required('ADMIN')
+receptionist_required = roles_required('RECEPTIONIST')
+TECHNICIAN_required = roles_required('TECHNICIAN')
 
 
 def json_body():
@@ -57,6 +65,8 @@ def database_error(error):
     app.logger.exception('Database operation failed')
     if request.path == '/api/payments/vnpay/ipn':
         return jsonify(RspCode='99', Message='Database error')
+    if request.path.startswith('/api/admin/') and isinstance(error, IntegrityError):
+        return jsonify(error='Du lieu trung lap hoac dang duoc tham chieu. Vui long kiem tra lai.'), 409
     return jsonify(error='Khong the luu/lay du lieu. Vui long thu lai.'), 500
 
 
@@ -70,8 +80,8 @@ def api_login():
     user = dao.authenticate(username, password)
     if not user:
         return jsonify(error='Sai tai khoan, mat khau hoac tai khoan bi khoa.'), 401
-    if user.role != 'CASHIER':
-        return jsonify(error='Chi thu ngan duoc dang nhap API thanh toan.'), 403
+    if user.role not in ('CASHIER', 'ADMIN'):
+        return jsonify(error='Tai khoan khong co quyen su dung API thanh toan/quan ly quy dinh.'), 403
     session.clear()
     login_user(user)
     session['csrf_token'] = secrets.token_hex(32)
@@ -80,7 +90,7 @@ def api_login():
 
 
 @app.route('/api/auth/logout', methods=['POST'])
-@cashier_required
+@roles_required('CASHIER', 'ADMIN')
 def api_logout():
     logout_user()
     session.clear()
@@ -155,6 +165,79 @@ def vnpay_return():
     return jsonify(transaction_reference=data.get('vnp_TxnRef'),
                    response_code=data.get('vnp_ResponseCode'),
                    message='Kiem tra trang thai hoa don qua API; Return URL khong xac nhan da thu tien.')
+
+
+# quản lý linh kiện cho Admin.
+@app.route('/api/admin/part-categories', methods=['GET', 'POST'])
+@admin_required
+def admin_part_categories():
+    if request.method == 'POST':
+        category = dao.save_part_category(json_body())
+        return jsonify(data=dao.category_to_dict(category)), 201
+    categories = dao.load_part_categories(kw=request.args.get('kw'),
+                                          status=request.args.get('status'), page=get_page())
+    return jsonify(data=[dao.category_to_dict(c) for c in categories])
+
+
+@app.route('/api/admin/part-categories/<int:category_id>', methods=['GET', 'PATCH', 'DELETE'])
+@admin_required
+def admin_part_category(category_id):
+    if request.method == 'PATCH':
+        category = dao.save_part_category(json_body(), category_id)
+    elif request.method == 'DELETE':
+        category = dao.save_part_category({'status': 'INACTIVE'}, category_id)
+    else:
+        category = dao.get_part_category(category_id)
+    return jsonify(data=dao.category_to_dict(category))
+
+
+@app.route('/api/admin/parts', methods=['GET', 'POST'])
+@admin_required
+def admin_parts():
+    if request.method == 'POST':
+        part = dao.save_part(json_body())
+        return jsonify(data=dao.part_to_dict(part)), 201
+    parts = dao.load_parts(kw=request.args.get('kw'), category_id=request.args.get('category_id'),
+                           active=request.args.get('is_active'), page=get_page())
+    return jsonify(data=[dao.part_to_dict(p) for p in parts])
+
+
+@app.route('/api/admin/parts/<int:part_id>', methods=['GET', 'PATCH', 'DELETE'])
+@admin_required
+def admin_part(part_id):
+    if request.method == 'PATCH':
+        part = dao.save_part(json_body(), part_id)
+    elif request.method == 'DELETE':
+        part = dao.save_part({'is_active': False}, part_id)
+    else:
+        part = dao.get_part(part_id)
+    return jsonify(data=dao.part_to_dict(part))
+
+#quản lý quy định cho Admin.
+@app.route('/api/admin/regulations', methods=['GET', 'POST', 'PATCH'])
+@admin_required
+def admin_regulations():
+    if request.method == 'GET':
+        regulation = dao.get_current_regulation()
+    else:
+        regulation = dao.save_regulation(json_body(), current_user.id, create=request.method == 'POST')
+    return jsonify(data=dao.regulation_to_dict(regulation)), 201 if request.method == 'POST' else 200
+
+
+@app.route('/api/admin/regulations/history')
+@admin_required
+def admin_regulation_history():
+    history = dao.load_regulation_history(page=get_page())
+    return jsonify(data=[{'id': h.id, 'regulation_id': h.regulation_id,
+                          'user_id': h.user_id, 'field_name': h.field_name,
+                          'old_value': h.old_value, 'new_value': h.new_value,
+                          'changed_at': h.changed_at.isoformat()} for h in history])
+
+
+@app.route('/api/admin/regulations/intake-capacity')
+@admin_required
+def admin_intake_capacity():
+    return jsonify(data=dao.get_intake_capacity(request.args.get('date')))
 
 
 @app.route('/')
