@@ -5,6 +5,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from eapp import db, app
+from flask_login import UserMixin
 
 
 class BaseModel(db.Model):
@@ -13,7 +14,7 @@ class BaseModel(db.Model):
     id = Column(Integer, primary_key=True, autoincrement=True)
 
 
-class User(BaseModel):
+class User(BaseModel, UserMixin):
     full_name = Column(String(120), nullable=False)
     username = Column(String(60), nullable=False, unique=True)
     password_hash = Column(String(255), nullable=False)
